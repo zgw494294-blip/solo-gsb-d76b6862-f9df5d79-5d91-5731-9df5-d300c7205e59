@@ -14,7 +14,9 @@ from app.solver import (
     SolverNotConverged,
     ValidationError,
     analyze_pipe_outages,
+    locate_single_leak,
     solve_network,
+    validate_leak_payload,
     validate_payload,
 )
 
@@ -493,3 +495,290 @@ def test_api_analyze_outages_empty_body():
     resp = client.post("/api/analyze-outages", content=b"",
                        headers={"Content-Type": "application/json"})
     assert resp.status_code == 400
+
+
+# ---------------------------- 单点漏损定位 ---------------------------- #
+def _leak_payload():
+    """与 base_loop 相同的 4 节点环网（S-A-B-C-S + 对角线 S-B）。"""
+    p = base_loop()
+    p["leak_upper_bound"] = 2.0
+    return p
+
+
+def _truth_heads(payload: dict, leak_node: str, leak: float) -> dict[str, float]:
+    """在给定节点需水量上增加 leak 后做一次“实测真值”求解。"""
+    net = validate_payload(payload)
+    bumped = [dict(n) for n in net.nodes]
+    for n in bumped:
+        if n["id"] == leak_node:
+            n["demand"] += leak
+    truth = solve_network(type(net)(nodes=bumped, pipes=net.pipes,
+                                    min_head=net.min_head))
+    return truth["heads"]
+
+
+def test_leak_locates_true_node_and_recovers_amount():
+    """真值：B 点额外漏 0.8，测点 A、C；最优候选必须是 B 且漏量约 0.8。"""
+    p = _leak_payload()
+    truth = _truth_heads(p, "B", 0.8)
+    p["measurements"] = [
+        {"node": "A", "head": truth["A"]},
+        {"node": "C", "head": truth["C"]},
+    ]
+    a = locate_single_leak(validate_leak_payload(p))
+
+    assert a["leak_detected"] is True
+    assert a["leak_node"] == "B"
+    best = a["candidates"][0]
+    assert best["node_id"] == "B"
+    assert best["leak"] == pytest.approx(0.8, abs=1e-8)
+    assert best["rmse"] < 1e-9
+    assert a["baseline_rmse"] > 1e-6  # 无漏损基线无法解释实测水头
+    # 预测水头即拟合解在测点上的水头，与实测基本吻合
+    assert best["predicted_heads"]["A"] == pytest.approx(truth["A"], abs=1e-8)
+    assert best["predicted_heads"]["C"] == pytest.approx(truth["C"], abs=1e-8)
+    assert abs(best["head_errors"]["A"]) < 1e-8
+    # 每个用水节点一个候选且带排名，排序按 RMSE 非降，同分保持录入顺序
+    assert [c["node_id"] for c in a["candidates"]] == ["B", "A", "C"]
+    rmses = [c["rmse"] for c in a["candidates"]]
+    assert rmses == sorted(rmses)
+    assert [c["rank"] for c in a["candidates"]] == [1, 2, 3]
+    assert a["counts"] == {"fitted": 3, "not_converged": 0}
+    assert a["indistinguishable"] is False
+    assert a["indistinguishable_nodes"] == ["B"]
+
+
+def test_leak_no_leak_baseline_zero_rmse_not_detected():
+    """实测水头恰好等于无漏损基线时，最优漏量为 0，不判定存在漏损。"""
+    p = _leak_payload()
+    base = solve_network(validate_payload(p))
+    p["measurements"] = [
+        {"node": "A", "head": base["heads"]["A"]},
+        {"node": "C", "head": base["heads"]["C"]},
+    ]
+    a = locate_single_leak(validate_leak_payload(p))
+    assert a["baseline_rmse"] == pytest.approx(0.0, abs=1e-12)
+    assert a["leak_detected"] is False
+    assert a["leak_node"] is None
+    # 三个候选在 0 漏量处都能完美拟合，构成无法区分（但仍不判定漏损）
+    assert a["indistinguishable"] is True
+    assert set(a["indistinguishable_nodes"]) == {"A", "B", "C"}
+    assert all(c["leak"] == 0.0 for c in a["candidates"])
+    assert "不判定存在漏损" in a["conclusion"]
+
+
+def test_leak_indistinguishable_symmetric_tree():
+    """对称挂枝网：B 直接挂水源侧，A、C 为对称枝；在 A 加漏 0.5，测点 B、D，
+    B/A/C 三节点拟合的漏量与 RMSE 相同，按录入顺序 B 居首但标为无法区分。"""
+    p = {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 40.0},
+            {"id": "B", "type": "demand", "demand": 1.0},
+            {"id": "D", "type": "demand", "demand": 1.0},
+            {"id": "A", "type": "demand", "demand": 1.0},
+            {"id": "C", "type": "demand", "demand": 1.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "B", "r": 1.0},
+            {"id": "P2", "start": "B", "end": "D", "r": 1.0},
+            {"id": "P3", "start": "B", "end": "A", "r": 1.0},
+            {"id": "P4", "start": "B", "end": "C", "r": 1.0},
+        ],
+        "min_head": 0.0,
+        "leak_upper_bound": 2.0,
+    }
+    truth = _truth_heads(p, "A", 0.5)
+    p["measurements"] = [
+        {"node": "B", "head": truth["B"]},
+        {"node": "D", "head": truth["D"]},
+    ]
+    a = locate_single_leak(validate_leak_payload(p))
+    top3 = a["candidates"][:3]
+    assert [c["node_id"] for c in top3] == ["B", "A", "C"]
+    assert all(c["leak"] == pytest.approx(0.5, abs=1e-8) for c in top3)
+    assert all(c["rmse"] == pytest.approx(top3[0]["rmse"], abs=1e-12) for c in top3)
+    assert a["indistinguishable"] is True
+    assert set(a["indistinguishable_nodes"]) == {"A", "B", "C"}
+    # 同分按录入顺序，最优节点为录入最早的 B
+    assert a["leak_node"] == "B"
+    assert a["leak_detected"] is True
+
+
+def test_leak_endpoint_upper_must_be_compared():
+    """真实漏量超过上限时，最优拟合漏量必须正好落在端点上限处（而非某个内点）。"""
+    p = _leak_payload()
+    p["leak_upper_bound"] = 1.0
+    truth = _truth_heads(p, "B", 3.0)
+    p["measurements"] = [
+        {"node": "A", "head": truth["A"]},
+        {"node": "C", "head": truth["C"]},
+    ]
+    a = locate_single_leak(validate_leak_payload(p))
+    best = a["candidates"][0]
+    assert best["leak"] == pytest.approx(1.0, abs=1e-12)
+    assert best["rmse"] < a["baseline_rmse"]
+
+
+def test_leak_validation_measurement_rules():
+    """测点与上限的各类非法输入都须被拒绝并给出中文原因。"""
+    def expect_error(mutate, fragment):
+        p = _leak_payload()
+        mutate(p)
+        with pytest.raises(ValidationError) as exc:
+            validate_leak_payload(p)
+        assert fragment in str(exc.value)
+
+    one = [{"node": "A", "head": 28.0}]
+    nine = [{"node": nid, "head": 28.0}
+            for nid in ["A", "B", "C"]] + [
+        {"node": f"Z{i}", "head": 1.0} for i in range(6)]
+    expect_error(lambda p: p.update(measurements=one), "2～8")
+    expect_error(lambda p: p.update(measurements=nine), "2～8")
+    expect_error(lambda p: p.update(measurements="x"), "measurements 必须是")
+    expect_error(lambda p: p.update(measurements=[{"node": "S", "head": 30.0},
+                                                  {"node": "A", "head": 28.0}]),
+                 "用水节点")
+    expect_error(lambda p: p.update(measurements=[{"node": "A", "head": 28.0},
+                                                  {"node": "A", "head": 27.0}]),
+                 "互异")
+    expect_error(lambda p: p.update(measurements=[{"node": "A", "head": 28.0},
+                                                  {"node": "ZZ", "head": 27.0}]),
+                 "用水节点")
+    expect_error(lambda p: p.update(measurements=[{"node": "A"},
+                                                  {"node": "B", "head": 27.0}]),
+                 "实测水头")
+    expect_error(lambda p: p.update(measurements=[{"node": "A", "head": float("inf")},
+                                                  {"node": "B", "head": 27.0}]),
+                 "有限")
+    valid_meas = [{"node": "A", "head": 28.0}, {"node": "C", "head": 27.0}]
+    expect_error(lambda p: p.update(measurements=valid_meas, leak_upper_bound=0.0),
+                 "正数")
+    expect_error(lambda p: p.update(measurements=valid_meas, leak_upper_bound=-1.0),
+                 "正数")
+    expect_error(lambda p: p.update(measurements=valid_meas,
+                                    leak_upper_bound=float("nan")),
+                 "有限")
+
+
+def test_leak_baseline_nonconvergence_propagates(monkeypatch):
+    """无漏损基线不收敛时整体报错（SolverNotConverged），由 API 转 422。"""
+    p = _leak_payload()
+    p["measurements"] = [{"node": "A", "head": 28.0}, {"node": "C", "head": 27.0}]
+
+    def boom(net):
+        raise SolverNotConverged("模拟基线不收敛")
+
+    monkeypatch.setattr("app.solver.solve_network", boom)
+    with pytest.raises(SolverNotConverged, match="基线"):
+        locate_single_leak(validate_leak_payload(p))
+
+
+def test_leak_single_candidate_failure_marked_and_last(monkeypatch):
+    """单个候选（B）所有非零漏量点均不收敛：标明 not_converged 排最后，其余照常。"""
+    p = {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 30.0},
+            {"id": "A", "type": "demand", "demand": 1.0},
+            {"id": "B", "type": "demand", "demand": 1.0},
+            {"id": "C", "type": "demand", "demand": 1.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+            {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+            {"id": "P3", "start": "B", "end": "C", "r": 1.0},
+        ],
+        "min_head": 0.0,
+        "leak_upper_bound": 2.0,
+        "measurements": [{"node": "A", "head": 27.0}, {"node": "C", "head": 20.0}],
+    }
+    real_solve = solve_network
+
+    def selective(net):
+        extra_b = next(n["demand"] for n in net.nodes if n["id"] == "B") - 1.0
+        if extra_b > 1e-12:
+            raise SolverNotConverged("模拟 B 候选不收敛")
+        return real_solve(net)
+
+    monkeypatch.setattr("app.solver.solve_network", selective)
+    a = locate_single_leak(validate_leak_payload(p))
+    assert a["counts"] == {"fitted": 2, "not_converged": 1}
+    failed = [c for c in a["candidates"] if c["status"] == "not_converged"]
+    assert [c["node_id"] for c in failed] == ["B"]
+    assert "未能收敛" in failed[0]["error"]
+    assert a["candidates"][-1]["node_id"] == "B"
+    assert "rmse" not in a["candidates"][-1]
+    # 成功候选仍然给出完整拟合字段
+    for c in a["candidates"][:-1]:
+        assert c["status"] == "fitted"
+        assert set(c["predicted_heads"]) == {"A", "C"}
+        assert c["rmse"] >= 0.0
+
+
+# ---------------------------- 单点漏损 API ---------------------------- #
+def test_api_locate_leak_ok():
+    p = _leak_payload()
+    truth = _truth_heads(p, "B", 0.8)
+    p["measurements"] = [
+        {"node": "A", "head": truth["A"]},
+        {"node": "C", "head": truth["C"]},
+    ]
+    resp = client.post("/api/locate-leak", json=p)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    a = data["leak_analysis"]
+    assert a["leak_detected"] is True
+    assert a["leak_node"] == "B"
+    assert a["candidates"][0]["leak"] == pytest.approx(0.8, abs=1e-8)
+    assert a["baseline"]["converged"] is True
+    assert a["leak_upper_bound"] == 2.0
+    assert [m["node"] for m in a["measurements"]] == ["A", "C"]
+
+
+def test_api_locate_leak_validation_error():
+    p = _leak_payload()
+    p["measurements"] = [{"node": "S", "head": 30.0}, {"node": "A", "head": 28.0}]
+    resp = client.post("/api/locate-leak", json=p)
+    assert resp.status_code == 422
+    assert "用水节点" in resp.json()["error"]
+
+
+def test_api_locate_leak_missing_upper_bound():
+    p = base_loop()
+    p["measurements"] = [{"node": "A", "head": 28.0}, {"node": "C", "head": 27.0}]
+    resp = client.post("/api/locate-leak", json=p)
+    assert resp.status_code == 422
+    assert "leak_upper_bound" in resp.json()["error"]
+
+
+def test_api_locate_leak_empty_body():
+    resp = client.post("/api/locate-leak", content=b"",
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 400
+
+
+def test_api_locate_leak_rejects_nan_token():
+    body = ('{"nodes":[{"id":"S","type":"source","head":30},'
+            '{"id":"A","type":"demand","demand":1}],'
+            '"pipes":[{"id":"P1","start":"S","end":"A","r":1}],'
+            '"min_head":0,"leak_upper_bound":1,'
+            '"measurements":[{"node":"A","head":NaN}]}')
+    resp = client.post("/api/locate-leak", content=body,
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 400
+    assert "JSON" in resp.json()["error"]
+
+
+def test_api_locate_leak_baseline_nonconvergence_422(monkeypatch):
+    """基线不收敛时 API 返回 422 与中文原因。"""
+    import app.solver as solver_mod
+
+    def boom(net):
+        raise SolverNotConverged("模拟基线不收敛")
+
+    monkeypatch.setattr(solver_mod, "solve_network", boom)
+    p = _leak_payload()
+    p["measurements"] = [{"node": "A", "head": 28.0}, {"node": "C", "head": 27.0}]
+    resp = client.post("/api/locate-leak", json=p)
+    assert resp.status_code == 422
+    assert "基线" in resp.json()["error"]

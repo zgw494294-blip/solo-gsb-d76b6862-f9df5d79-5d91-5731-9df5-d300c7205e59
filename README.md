@@ -81,6 +81,7 @@ H_i − H_j = r_p · q_p · |q_p|
 | --- | --- | --- |
 | `POST` | `/api/solve` | 入参 `{nodes, pipes, min_head}`，返回水头、流量、流向、供水量与各项残差；非法输入返回 `422`/`400` 与中文原因 |
 | `POST` | `/api/analyze-outages` | 入参与 `/api/solve` 相同；先求基线，再对每根管段各评估一个“单独停用”情景并按风险排序返回 |
+| `POST` | `/api/locate-leak` | 入参为管网参数 + `measurements`（2～8 个互异用水节点的实测水头）+ 正的 `leak_upper_bound`；逐用水节点拟合单点漏量并按测点误差排序 |
 | `GET` | `/api/health` | 健康检查 |
 
 请求示例：
@@ -152,21 +153,119 @@ curl -s http://localhost:8000/api/analyze-outages \
 }
 ```
 
+### 单点漏损定位 `POST /api/locate-leak`
+
+> 漏损定位与求解共用同一服务、同一端口，**不需要任何额外服务或新的启动步骤**——
+> `docker compose up --build` 后即可直接调用。
+
+在管网参数（与 `/api/solve` 完全一致，沿用同一套输入校验）之外，请求体还需包含：
+
+- `measurements`：**2～8 个**实测水头测点，每项为 `{"node": 节点编号, "head": 实测水头}`，
+  测点必须**互异且全部为用水节点**，实测水头必须是有限数值；
+- `leak_upper_bound`：正的有限数值，即每个候选节点允许增加漏量的搜索上限。
+
+后端先求**无漏损基线**（基线不收敛时整个请求返回 `422` 并说明原因），随后在
+**“至多一个用水节点增加漏量”** 的假定下，对每个用水节点各构造一个候选：把该节点需水量
+增加 x（x ∈ [0, 上限]），重新做稳态求解，取测点预测水头与实测水头的**均方根误差 RMSE**
+作为目标；用黄金分割在 `[0, 上限]` 内一维寻优，**端点 0 与上限都显式参与比较**
+（区间内部偶尔求解失败的点按 +∞ 跳过，搜索会自然收缩到可解区域）。
+
+响应 `leak_analysis` 含：
+
+- `baseline_rmse` / `baseline_predicted_heads`：无漏损基线的测点 RMSE 与基线预测水头，
+  `baseline` 为完整基线稳态解（结构与 `/api/solve` 的 `result` 相同）；
+- `candidates`：每个用水节点一个，按 RMSE **升序**排列，同分按**节点录入顺序**：
+  - 成功候选：`status: "fitted"`、`leak`（拟合漏量，可能为端点 0）、`predicted_heads`
+    （各测点预测水头）、`head_errors`（预测−实测，带符号）、`rmse`、`sse`、`rank`；
+  - 失败候选：`status: "not_converged"`、`error`（中文原因），**单独标明并排最后**，
+    不影响其他候选（`counts` 给出两类数量）；
+- `indistinguishable` / `indistinguishable_nodes`：若至少有两个候选与最优 RMSE 相差
+  **不超过 1e-4**，这些候选一律标为**无法区分**；
+- `leak_detected` / `leak_node` / `conclusion`：**最优漏量为 0 时不判定存在漏损**
+  （`leak_detected=false`、`leak_node=null`）；否则给出最可能的漏损节点与拟合漏量，
+  并在结论文字中说明是否存在无法区分的并列候选。
+
+curl 调用示例（该管网真值为 B 点额外漏损 0.8，实测水头取 A、C 两点）：
+
+```bash
+curl -s http://localhost:8000/api/locate-leak \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "min_head": 10,
+    "nodes": [
+      {"id": "S", "type": "source", "head": 30.0},
+      {"id": "A", "type": "demand", "demand": 1.0},
+      {"id": "B", "type": "demand", "demand": 1.0},
+      {"id": "C", "type": "demand", "demand": 1.0}
+    ],
+    "pipes": [
+      {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+      {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+      {"id": "P3", "start": "B", "end": "C", "r": 1.0},
+      {"id": "P4", "start": "C", "end": "S", "r": 1.0},
+      {"id": "P5", "start": "S", "end": "B", "r": 2.5}
+    ],
+    "measurements": [
+      {"node": "A", "head": 27.959627},
+      {"node": "C", "head": 27.959627}
+    ],
+    "leak_upper_bound": 2.0
+  }'
+```
+
+返回（节选）：无漏损基线 RMSE≈0.7462；B 点以漏量 0.8 把 RMSE 降到 ≈0，明显优于 A、C
+（RMSE≈0.1151），故判定漏损在 B；`head_errors` 为预测水头减实测水头：
+
+```json
+{
+  "ok": true,
+  "leak_analysis": {
+    "leak_upper_bound": 2.0,
+    "tie_tolerance": 0.0001,
+    "baseline_rmse": 0.746177,
+    "baseline_predicted_heads": {"A": 28.705804, "C": 28.705804},
+    "candidates": [
+      {"rank": 1, "node_id": "B", "status": "fitted", "leak": 0.8,
+       "predicted_heads": {"A": 27.959627, "C": 27.959627},
+       "head_errors": {"A": 0.0, "C": 0.0}, "rmse": 0.0},
+      {"rank": 2, "node_id": "A", "status": "fitted", "leak": 0.74109,
+       "predicted_heads": {"A": 27.874847, "C": 28.098663},
+       "head_errors": {"A": -0.08478, "C": 0.139036}, "rmse": 0.115149},
+      {"rank": 3, "node_id": "C", "status": "fitted", "leak": 0.74109,
+       "predicted_heads": {"A": 28.098663, "C": 27.874847},
+       "head_errors": {"A": 0.139036, "C": -0.08478}, "rmse": 0.115149}
+    ],
+    "counts": {"fitted": 3, "not_converged": 0},
+    "best": {"node_id": "B", "leak": 0.8, "rmse": 0.0},
+    "indistinguishable": false,
+    "indistinguishable_nodes": ["B"],
+    "leak_detected": true,
+    "leak_node": "B",
+    "conclusion": "最可能的单点漏损位于用水节点“B”，拟合漏量为 0.8（测点 RMSE=1.07e-14）。"
+  }
+}
+```
+
+非法输入（测点数不在 2～8、测点重复或不是用水节点、实测水头/上限非有限值、上限非正、
+原有管网校验未通过等）返回 `422`/`400` 并附中文原因。
+
 ## 输入约束汇总
 
 - 节点 2～10 个，编号为非空且唯一的字符串；
 - 恰好 1 个 `source`（固定水头，有限数值），其余为 `demand`（需水量为非负有限数）；
 - 管段 1～16 根，编号唯一，起点/终点均为已定义且互不相同的节点，同一对节点之间只允许一根管段，阻力 r 为正有限数；
 - 管网必须是**无向连通图**（孤立节点/孤岛一律拒绝）；
-- 不接受 `NaN` / `Infinity`（含 JSON 文本中的 `NaN`/`Infinity` 记号）。
+- 不接受 `NaN` / `Infinity`（含 JSON 文本中的 `NaN`/`Infinity` 记号）；
+- 仅 `/api/locate-leak` 额外要求：`measurements` 为 2～8 个测点，节点编号互异且均为
+  用水节点，实测水头为有限数值；`leak_upper_bound` 为正有限数。
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py            # FastAPI 入口：/api/solve、/api/analyze-outages、/api/health、静态页面
-│   ├── solver.py          # 输入校验 + Newton 稳态求解 + 1e-6 复核 + 逐根停管情景分析
+│   ├── main.py            # FastAPI 入口：/api/solve、/api/analyze-outages、/api/locate-leak、/api/health、静态页面
+│   ├── solver.py          # 输入校验 + Newton 稳态求解 + 1e-6 复核 + 逐根停管情景分析 + 单点漏损定位（黄金分割）
 │   └── static/
 │       ├── index.html     # 原生页面（含停管分析入口与结果表）
 │       ├── style.css
@@ -184,4 +283,4 @@ pip install -r requirements.txt pytest httpx
 PYTHONPATH=. pytest -q
 ```
 
-测试包含单管解析解、反向录入符号、环状网独立复核、低水头标记、各类非法输入、`NaN` JSON 拒绝，以及 60 个随机连通管网（2～10 节点、最多 16 管、阻力跨 6 个数量级）的收敛性与残差检查；停管分析部分覆盖树状网全断联按失供量排序、环+枝混合分组排序、比基线新增低水头节点、同分保持录入顺序、单情景不收敛单独排最后，以及 `/api/analyze-outages` 的 200/422/400 分支。
+测试包含单管解析解、反向录入符号、环状网独立复核、低水头标记、各类非法输入、`NaN` JSON 拒绝，以及 60 个随机连通管网（2～10 节点、最多 16 管、阻力跨 6 个数量级）的收敛性与残差检查；停管分析部分覆盖树状网全断联按失供量排序、环+枝混合分组排序、比基线新增低水头节点、同分保持录入顺序、单情景不收敛单独排最后，以及 `/api/analyze-outages` 的 200/422/400 分支；漏损定位部分覆盖真值漏点与漏量回收、无漏损基线 RMSE=0 不判漏、对称网络多候选无法区分、最优漏量落在上限端点、测点/上限各类非法输入、基线不收敛整体报错、单候选失败隔离排最后，以及 `/api/locate-leak` 的 200/422/400 分支。

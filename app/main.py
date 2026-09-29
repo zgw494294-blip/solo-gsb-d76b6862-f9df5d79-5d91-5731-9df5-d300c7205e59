@@ -14,7 +14,9 @@ from .solver import (
     SolverNotConverged,
     ValidationError,
     analyze_pipe_outages,
+    locate_single_leak,
     solve_network,
+    validate_leak_payload,
     validate_payload,
 )
 
@@ -86,6 +88,26 @@ async def analyze_outages(request: Request) -> JSONResponse:
                             content={"ok": False, "error": str(exc)})
 
     return JSONResponse(content={"ok": True, "analysis": analysis})
+
+
+@app.post("/api/locate-leak")
+async def locate_leak(request: Request) -> JSONResponse:
+    """基于实测水头的单点漏损定位：沿用管网校验与稳态求解，逐用水节点拟合漏量。"""
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
+
+    try:
+        case = validate_leak_payload(payload)
+        analysis = locate_single_leak(case)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+    except SolverNotConverged as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(content={"ok": True, "leak_analysis": analysis})
 
 
 # 静态资源（index.html / style.css / app.js）——该路由必须最后注册

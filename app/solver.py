@@ -573,3 +573,264 @@ def analyze_pipe_outages(net: Network) -> dict[str, Any]:
         "scenarios": scenarios,
         "counts": counts,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 基于实测水头的单点漏损定位
+# --------------------------------------------------------------------------- #
+MIN_MEASUREMENTS, MAX_MEASUREMENTS = 2, 8
+# 候选间“无法区分”的 RMSE 阈值：与最优 RMSE 相差不超过该值即视为同分
+LEAK_RMSE_TIE_TOL = 1.0e-4
+# 黄金分割搜索迭代次数（每迭代区间按 0.618 缩减，40 次后相对宽度约 6.6e-9）
+LEAK_GOLDEN_ITERATIONS = 40
+# 粗扫网格的区间数（共 N+1 个均匀点，含两个端点），先定位全局最优所在网格
+LEAK_GRID_SECTIONS = 16
+# 最优漏量相对上限小到该比例以内时，按数值噪声归并为端点 0（无漏损）
+LEAK_ZERO_REL = 1.0e-9
+
+
+@dataclass(frozen=True)
+class LeakCase:
+    """一次单点漏损定位的全部输入。"""
+    network: Network
+    measurements: list[tuple[str, float]]  # [(测点编号, 实测水头)]，保持录入顺序
+    leak_upper_bound: float
+
+
+def validate_leak_payload(payload: Any) -> LeakCase:
+    """在校验管网的基础上追加校验测点与漏量上限，返回规范化 LeakCase。"""
+    net = validate_payload(payload)
+    demand_ids = {n["id"] for n in net.nodes if n["type"] == "demand"}
+
+    raw_measurements = payload.get("measurements")
+    if not isinstance(raw_measurements, list):
+        raise ValidationError("measurements 必须是测点对象数组。")
+    if not (MIN_MEASUREMENTS <= len(raw_measurements) <= MAX_MEASUREMENTS):
+        raise ValidationError(
+            f"实测水头测点必须在 {MIN_MEASUREMENTS}～{MAX_MEASUREMENTS} 个之间，"
+            f"当前为 {len(raw_measurements)} 个。")
+
+    measurements: list[tuple[str, float]] = []
+    seen_measurements: set[str] = set()
+    for k, raw in enumerate(raw_measurements, start=1):
+        if not isinstance(raw, dict):
+            raise ValidationError(f"第 {k} 个测点必须是对象。")
+        nid = raw.get("node")
+        if not isinstance(nid, str) or not nid.strip():
+            raise ValidationError(f"第 {k} 个测点缺少有效的节点编号（非空字符串）。")
+        nid = nid.strip()
+        if nid not in demand_ids:
+            raise ValidationError(
+                f"测点“{nid}”不是已定义的用水节点（测点必须全部为用水节点）。")
+        if nid in seen_measurements:
+            raise ValidationError(f"测点“{nid}”重复，所有测点必须互异。")
+        seen_measurements.add(nid)
+        head = _as_finite(raw.get("head"), f"测点“{nid}”的实测水头")
+        measurements.append((nid, head))
+
+    upper = _as_finite(
+        payload.get("leak_upper_bound"), "漏量上限 leak_upper_bound", positive=True)
+
+    return LeakCase(network=net, measurements=measurements, leak_upper_bound=upper)
+
+
+def _network_with_extra_demand(net: Network, leak_node_id: str,
+                               extra: float) -> Network:
+    """在指定用水节点的需水量上增加 extra（其余数据不变），返回新 Network。"""
+    nodes: list[dict[str, Any]] = []
+    for node in net.nodes:
+        if node["type"] == "demand" and node["id"] == leak_node_id:
+            bumped = dict(node)
+            bumped["demand"] = float(node["demand"]) + float(extra)
+            nodes.append(bumped)
+        else:
+            nodes.append(node)
+    return Network(nodes=nodes, pipes=net.pipes, min_head=net.min_head)
+
+
+def locate_single_leak(case: LeakCase) -> dict[str, Any]:
+    """假定至多一个用水节点存在漏损，逐节点在 [0, 上限] 内拟合最优漏量。
+
+    流程：
+      1. 求无漏损基线（不收敛则直接抛 SolverNotConverged），计算基线测点 RMSE；
+      2. 对每个用水节点，把“在该节点增加漏量 x”当作一维问题：测点预测水头由
+         稳态求解器给出，目标为测点均方根误差 RMSE(x)。额外取水使各点水头沿 x
+         单调不升，RMSE 为分段光滑曲线；为兼顾多峰/平底情形，先在 [0, 上限] 上
+         均匀粗扫（两端点必评）锁定全局最优所在网格，再在该网格内黄金分割精修，
+         端点 0 与上限都显式参与比较，不收敛的点按 +∞ 处理；
+      3. 单个候选拟合失败（上限端无法求解等）时标明 not_converged 并排最后，
+         不影响其他候选；
+      4. 成功候选按 RMSE 升序、同分按节点录入顺序排列；与最优 RMSE 相差不超过
+         1e-4 的候选至少有两个时，标记为“无法区分”；最优漏量为 0 时不判定漏损。
+    """
+    net = case.network
+    upper = float(case.leak_upper_bound)
+    meas_ids = [nid for nid, _ in case.measurements]
+    meas_heads = np.array([h for _, h in case.measurements], dtype=float)
+    n_meas = len(meas_ids)
+
+    # ---- 无漏损基线（失败则整个分析无法进行） -----------------------------
+    baseline = solve_network(net)
+    baseline_pred = {nid: float(baseline["heads"][nid]) for nid in meas_ids}
+    baseline_vec = np.array([baseline_pred[nid] for nid in meas_ids])
+    baseline_sse = float(np.sum((baseline_vec - meas_heads) ** 2))
+    baseline_rmse = math.sqrt(baseline_sse / n_meas)
+
+    candidates: list[dict[str, Any]] = []
+    for node_index, node in enumerate(net.nodes):
+        if node["type"] != "demand":
+            continue
+        cand_id = node["id"]
+        candidate: dict[str, Any] = {"node_id": cand_id, "node_index": node_index}
+        try:
+            # x -> (sse, {测点: 预测水头})；None 表示该漏量下稳态求解失败。
+            # 所有候选的 x=0 都是同一条无漏损基线，直接播种，避免重复求解。
+            cache: dict[float, tuple[float, dict[str, float]] | None] = {
+                0.0: (baseline_sse, baseline_pred)}
+
+            def evaluate(x: float):
+                x = float(x)
+                if x in cache:
+                    return cache[x]
+                try:
+                    result = solve_network(_network_with_extra_demand(net, cand_id, x))
+                except SolverNotConverged:
+                    cache[x] = None
+                    return None
+                pred = {nid: float(result["heads"][nid]) for nid in meas_ids}
+                vec = np.array([pred[nid] for nid in meas_ids])
+                sse = float(np.sum((vec - meas_heads) ** 2))
+                cache[x] = (sse, pred)
+                return cache[x]
+
+            # 上端点必须可比较；上限端不收敛则该候选拟合失败
+            if evaluate(upper) is None:
+                raise SolverNotConverged(
+                    f"漏量上限 {upper:g} 处稳态求解未能收敛，无法完成上端点比较。")
+
+            # ---- 均匀粗扫（两端点必评）：定位全局最优所在网格 ----------------
+            grid = [upper * i / LEAK_GRID_SECTIONS
+                    for i in range(LEAK_GRID_SECTIONS + 1)]
+            grid_vals: list[float] = []
+            for x in grid:
+                value = evaluate(x)
+                grid_vals.append(math.inf if value is None else value[0])
+            best_i = min(range(len(grid)), key=lambda i: (grid_vals[i], i))
+            lo_i = best_i - 1 if best_i > 0 else 0
+            hi_i = best_i + 1 if best_i < LEAK_GRID_SECTIONS else LEAK_GRID_SECTIONS
+
+            # ---- 在包围最优网格点的区间内黄金分割精修 ----------------------
+            a, b = grid[lo_i], grid[hi_i]
+            golden = (math.sqrt(5.0) - 1.0) / 2.0
+            x1, x2 = b - golden * (b - a), a + golden * (b - a)
+            f1, f2 = evaluate(x1), evaluate(x2)
+            for _ in range(LEAK_GOLDEN_ITERATIONS):
+                v1 = math.inf if f1 is None else f1[0]
+                v2 = math.inf if f2 is None else f2[0]
+                if a == b:  # 最优恰在端点（区间宽度为 0）时无需精修
+                    break
+                if v1 < v2:
+                    b, x2, f2 = x2, x1, f1
+                    x1 = b - golden * (b - a)
+                    f1 = evaluate(x1)
+                else:
+                    a, x1, f1 = x1, x2, f2
+                    x2 = a + golden * (b - a)
+                    f2 = evaluate(x2)
+
+            # 在所有实际评估过的漏量中取最优；同分优先较小漏量（含端点 0）
+            best_x, (best_sse, best_pred) = min(
+                ((x, value) for x, value in cache.items() if value is not None),
+                key=lambda item: (item[1][0], item[0]))
+
+            # 最优位置与 0 仅差数值噪声时，归并为无漏损端点
+            if 0.0 < float(best_x) <= LEAK_ZERO_REL * upper:
+                best_x, best_sse, best_pred = (
+                    0.0, baseline_sse, baseline_pred)
+
+            candidate.update({
+                "status": "fitted",
+                "leak": float(best_x),
+                "predicted_heads": best_pred,
+                "head_errors": {nid: float(best_pred[nid] - h)
+                                for nid, h in zip(meas_ids, meas_heads)},
+                "sse": float(best_sse),
+                "rmse": math.sqrt(best_sse / n_meas),
+                "evaluations": len(cache),
+            })
+        except Exception as exc:  # noqa: BLE001 - 单候选失败隔离，不影响其余候选
+            candidate.update({"status": "not_converged", "error": str(exc)})
+        candidates.append(candidate)
+
+    # 排序：成功候选按 RMSE 升序，同分按节点录入顺序；失败候选一律排最后
+    def candidate_key(c: dict[str, Any]) -> tuple[int, float, int]:
+        if c["status"] == "fitted":
+            return (0, c["rmse"], c["node_index"])
+        return (1, 0.0, c["node_index"])
+
+    candidates.sort(key=candidate_key)
+    for rank, c in enumerate(candidates, start=1):
+        c["rank"] = rank
+
+    fitted = [c for c in candidates if c["status"] == "fitted"]
+    counts = {"fitted": len(fitted),
+              "not_converged": len(candidates) - len(fitted)}
+
+    best = fitted[0] if fitted else None
+    indistinguishable_nodes: list[str] = []
+    if best is not None:
+        best_rmse = best["rmse"]
+        indistinguishable_nodes = [
+            c["node_id"] for c in fitted
+            if c["rmse"] - best_rmse <= LEAK_RMSE_TIE_TOL]
+    indistinguishable = len(indistinguishable_nodes) >= 2
+    leak_detected = best is not None and best["leak"] > 0.0
+
+    if best is None:
+        conclusion = "所有候选节点的漏损拟合均失败，无法判断漏损位置。"
+        leak_node = None
+    elif not leak_detected:
+        leak_node = None
+        if indistinguishable:
+            conclusion = (
+                "最优漏量为 0，按规则不判定存在漏损；但有 "
+                f"{len(indistinguishable_nodes)} 个候选（"
+                + "、".join(indistinguishable_nodes)
+                + "）的测点误差与最优值相差不超过 1e-4，彼此无法区分。")
+        else:
+            conclusion = "最优漏量为 0，实测水头与无漏损基线吻合，按规则不判定存在漏损。"
+    else:
+        leak_node = best["node_id"]
+        if indistinguishable:
+            conclusion = (
+                f"测点误差最小的节点为“{leak_node}”，拟合漏量 "
+                f"{best['leak']:.6g}；但有 {len(indistinguishable_nodes)} 个候选（"
+                + "、".join(indistinguishable_nodes)
+                + "）的误差与最优值相差不超过 1e-4，漏损位置无法区分。")
+        else:
+            conclusion = (
+                f"最可能的单点漏损位于用水节点“{leak_node}”，"
+                f"拟合漏量为 {best['leak']:.6g}（测点 RMSE={best['rmse']:.6g}）。")
+
+    return {
+        "measurements": [{"node": nid, "measured_head": float(h)}
+                         for nid, h in case.measurements],
+        "leak_upper_bound": upper,
+        "tie_tolerance": LEAK_RMSE_TIE_TOL,
+        "golden_iterations": LEAK_GOLDEN_ITERATIONS,
+        "baseline": baseline,
+        "baseline_predicted_heads": baseline_pred,
+        "baseline_rmse": baseline_rmse,
+        "candidates": candidates,
+        "counts": counts,
+        "best": None if best is None else {
+            "node_id": best["node_id"],
+            "leak": best["leak"],
+            "rmse": best["rmse"],
+        },
+        "indistinguishable": indistinguishable,
+        "indistinguishable_nodes": indistinguishable_nodes,
+        "leak_detected": leak_detected,
+        "leak_node": leak_node,
+        "conclusion": conclusion,
+    }
