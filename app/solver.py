@@ -29,6 +29,15 @@ SOLVER_TARGET_TOL = 1.0e-9
 MIN_NODES, MAX_NODES = 2, 10
 MIN_PIPES, MAX_PIPES = 1, 16
 
+# 实测水头测点数量
+MIN_MEASUREMENTS, MAX_MEASUREMENTS = 2, 8
+# 候选误差与最优误差相差不超过该绝对值时，判为无法区分
+INDISTINGUISHABLE_TOL = 1.0e-4
+# 拟合漏量不超过 上限×该相对系数（且不小于 1e-9）时视为 0，不判定漏损
+ZERO_LEAK_REL_TOL = 1.0e-9
+# 有界一维搜索的网格分段数（含 0 与上限两个端点）
+LEAK_GRID_SEGMENTS = 16
+
 
 class ValidationError(ValueError):
     """提交的管网描述不合法。"""
@@ -182,6 +191,54 @@ def validate_payload(payload: Any) -> Network:
             + "、".join(unreachable) + "。")
 
     return Network(nodes=nodes, pipes=pipes, min_head=min_head)
+
+
+def validate_leak_payload(payload: Any) -> tuple[Network, list[dict[str, Any]], float]:
+    """校验单点漏损分析输入。
+
+    沿用 validate_payload 的全部管网校验，另外校验：
+      * measurements：2～8 个测点，每个测点 {"node": 用水节点编号, "head": 有限数值}，
+        测点必须互异且全部是用水节点（不能是水源）；
+      * leak_upper_bound：正的有限数值，作为每个候选节点漏量的统一搜索上限。
+
+    返回 (Network, 规范化测点列表[保持录入顺序], 漏量上限)。
+    """
+    net = validate_payload(payload)
+    demand_ids = [n["id"] for n in net.nodes if n["type"] == "demand"]
+
+    raw_meas = payload.get("measurements")
+    if not isinstance(raw_meas, list):
+        raise ValidationError("measurements 必须是实测水头测点对象数组。")
+    if not (MIN_MEASUREMENTS <= len(raw_meas) <= MAX_MEASUREMENTS):
+        raise ValidationError(
+            f"实测水头测点数量必须在 {MIN_MEASUREMENTS}～{MAX_MEASUREMENTS} 之间，"
+            f"当前为 {len(raw_meas)} 个。")
+
+    measurements: list[dict[str, Any]] = []
+    seen_meas: set[str] = set()
+    for k, raw in enumerate(raw_meas, start=1):
+        if not isinstance(raw, dict):
+            raise ValidationError(f"第 {k} 个测点必须是对象。")
+        node_id = raw.get("node")
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise ValidationError(
+                f"第 {k} 个测点缺少有效的节点编号（非空字符串）。")
+        node_id = node_id.strip()
+        if node_id not in demand_ids:
+            raise ValidationError(
+                f"第 {k} 个测点“{node_id}”不是已定义的用水节点"
+                "（测点必须是用水节点，不能选择水源）。")
+        if node_id in seen_meas:
+            raise ValidationError(
+                f"测点节点“{node_id}”重复，各测点必须互异。")
+        seen_meas.add(node_id)
+        head = _as_finite(raw.get("head"), f"测点“{node_id}”的实测水头")
+        measurements.append({"node": node_id, "head": head})
+
+    upper = _as_finite(
+        payload.get("leak_upper_bound"), "漏量上限 leak_upper_bound", positive=True)
+
+    return net, measurements, upper
 
 
 # --------------------------------------------------------------------------- #
@@ -572,4 +629,192 @@ def analyze_pipe_outages(net: Network) -> dict[str, Any]:
         "baseline_below_min_head": baseline["below_min_head"],
         "scenarios": scenarios,
         "counts": counts,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 单点漏损定位
+# --------------------------------------------------------------------------- #
+def _network_with_extra_demand(net: Network, node_id: str,
+                               extra: float) -> Network:
+    """在指定用水节点的需水量上叠加额外漏量 extra，其余不变。
+
+    仅复制被修改的节点字典，其余节点与全部管段沿用原对象。
+    """
+    nodes: list[dict[str, Any]] = []
+    for node in net.nodes:
+        if node["id"] == node_id:
+            nodes.append({"id": node["id"], "type": "demand",
+                          "demand": node["demand"] + extra})
+        else:
+            nodes.append(node)
+    return Network(nodes=nodes, pipes=net.pipes, min_head=net.min_head)
+
+
+def locate_single_leak(net: Network, measurements: list[dict[str, Any]],
+                       upper: float) -> dict[str, Any]:
+    """根据实测水头排查“至多一个用水节点增加漏量”的位置与漏量。
+
+    先求无漏损基线；再对每个用水节点候选，在漏量 [0, upper] 上最小化
+    测点水头预测值与实测值的均方根误差（RMSE）。搜索采用粗网格（含两个
+    端点）定位最优区间，再以有界 Brent 细化，端点 0 与 upper 均显式比较。
+
+    候选按误差升序、同分按节点录入顺序排列；个别候选在所有漏量上都无法
+    得到收敛解时标记 fit_failed 并排末尾，不影响其他候选。
+    """
+    meas_ids = [m["node"] for m in measurements]
+    meas_heads = np.array([m["head"] for m in measurements], dtype=float)
+
+    # ---- 无漏损基线（不收敛由调用方按既有方式返回错误） -------------------
+    baseline = solve_network(net)
+    baseline_pred = {nid: baseline["heads"][nid] for nid in meas_ids}
+    baseline_err = float(
+        np.sqrt(np.mean([(baseline_pred[nid] - h) ** 2
+                         for nid, h in zip(meas_ids, meas_heads)])))
+
+    demand_ids = [n["id"] for n in net.nodes if n["type"] == "demand"]
+
+    def predict(node_id: str, leak: float) -> dict[str, float]:
+        """假设漏量 leak 加在 node_id 上，返回各测点预测水头；不收敛时抛错。"""
+        scenario = _network_with_extra_demand(net, node_id, leak)
+        result = solve_network(scenario)
+        return {nid: result["heads"][nid] for nid in meas_ids}
+
+    def rmse(pred: dict[str, float]) -> float:
+        return float(np.sqrt(np.mean(
+            [(pred[nid] - h) ** 2 for nid, h in zip(meas_ids, meas_heads)])))
+
+    zero_tol = max(1.0e-9, ZERO_LEAK_REL_TOL * upper)
+
+    candidates: list[dict[str, Any]] = []
+    for idx, node_id in enumerate(demand_ids):
+        # 漏量 -> (rmse, 预测水头) 缓存：网格端点与 Brent 内点共享
+        cache: dict[float, tuple[float, dict[str, float]]] = {}
+
+        def objective(leak: float) -> float:
+            key = float(leak)
+            if key not in cache:
+                try:
+                    pred = predict(node_id, key)
+                except SolverNotConverged:
+                    cache[key] = None  # type: ignore[assignment]
+                else:
+                    cache[key] = (rmse(pred), pred)
+            entry = cache[key]
+            return entry[0] if entry is not None else math.inf
+
+        try:
+            # ---- 粗网格（端点 0、upper 都包含在内） ----------------------
+            grid = [upper * k / LEAK_GRID_SEGMENTS
+                    for k in range(LEAK_GRID_SEGMENTS + 1)]
+            grid_errs = [objective(x) for x in grid]
+            best_k = min(range(len(grid)), key=lambda k: grid_errs[k])
+
+            # ---- 在最优点所在网格区间内做有界 Brent 细化 ----------------
+            lo = grid[max(0, best_k - 1)]
+            hi = grid[min(LEAK_GRID_SEGMENTS, best_k + 1)]
+            if hi > lo and math.isfinite(grid_errs[best_k]):
+                try:
+                    optimize.minimize_scalar(
+                        objective, bounds=(lo, hi), method="bounded",
+                        options={"xatol": 1.0e-11, "maxiter": 200})
+                except Exception:  # noqa: BLE001 - 细化失败则退回网格结果
+                    pass
+
+            # ---- 端点必须参与最终比较（bounded Brent 严格位于开区间内） -
+            objective(0.0)
+            objective(upper)
+
+            feasible = [(x, val) for x, val in cache.items() if val is not None]
+            if not feasible:
+                # 单独构造一次以取到底层求解器的中文原因
+                detail = "求解器未返回收敛解"
+                try:
+                    predict(node_id, 0.0)
+                except SolverNotConverged as exc:
+                    detail = str(exc)
+                raise SolverNotConverged(
+                    f"候选节点“{node_id}”在 0～{upper:g} 的全部漏量上均无法得到"
+                    f"收敛解（漏量 0 处的错误：{detail}）。")
+
+            best_leak, (best_err, best_pred) = min(
+                feasible, key=lambda item: (item[1][0], abs(item[0])))
+        except SolverNotConverged as exc:
+            candidates.append({
+                "node_index": idx,
+                "node_id": node_id,
+                "status": "fit_failed",
+                "error": str(exc),
+            })
+            continue
+
+        candidates.append({
+            "node_index": idx,
+            "node_id": node_id,
+            "status": "fitted",
+            "leak": float(best_leak),
+            "rmse": float(best_err),
+            "predicted_heads": [
+                {"node": nid,
+                 "measured_head": float(h),
+                 "predicted_head": float(best_pred[nid]),
+                 "error": float(best_pred[nid] - h)}
+                for nid, h in zip(meas_ids, meas_heads)
+            ],
+            "at_bound": bool(best_leak >= upper - zero_tol),
+        })
+
+    # ---- 排序：成功候选按 RMSE 升序、同分按节点录入顺序；失败候选排末尾 --
+    fitted = [c for c in candidates if c["status"] == "fitted"]
+    failed = [c for c in candidates if c["status"] == "fit_failed"]
+    fitted.sort(key=lambda c: (c["rmse"], c["node_index"]))
+    failed.sort(key=lambda c: c["node_index"])
+    ordered = fitted + failed
+    for rank, c in enumerate(ordered, start=1):
+        c["rank"] = rank
+
+    best_err = fitted[0]["rmse"] if fitted else math.inf
+    indistinguishable_ids: list[str] = []
+    for c in fitted:
+        c["indistinguishable"] = bool(
+            abs(c["rmse"] - best_err) <= INDISTINGUISHABLE_TOL)
+        if c["indistinguishable"]:
+            indistinguishable_ids.append(c["node_id"])
+
+    # ---- 结论 -------------------------------------------------------------
+    best_id = fitted[0]["node_id"] if fitted else None
+    if not fitted:
+        verdict, leak_node, leak_value = "fit_failed", None, None
+    elif fitted[0]["leak"] <= zero_tol:
+        # 最优漏量为 0：不判定存在漏损（基线本身拟合最好）
+        verdict, leak_node, leak_value = "no_leak", None, 0.0
+    elif len(indistinguishable_ids) >= 2:
+        verdict = "indistinguishable"
+        leak_node, leak_value = None, None
+    else:
+        verdict = "located"
+        leak_node = best_id
+        leak_value = fitted[0]["leak"]
+
+    return {
+        "measurements": measurements,
+        "leak_upper_bound": upper,
+        "indistinguishable_tol": INDISTINGUISHABLE_TOL,
+        "baseline": baseline,
+        "baseline_rmse": baseline_err,
+        "baseline_predicted_heads": [
+            {"node": nid,
+             "measured_head": float(h),
+             "predicted_head": float(baseline_pred[nid]),
+             "error": float(baseline_pred[nid] - h)}
+            for nid, h in zip(meas_ids, meas_heads)
+        ],
+        "candidates": ordered,
+        "best_rmse": None if not math.isfinite(best_err) else float(best_err),
+        "indistinguishable_nodes": indistinguishable_ids,
+        "leak_detected": verdict == "located",
+        "leak_node": leak_node,
+        "leak_value": leak_value,
+        "verdict": verdict,
+        "counts": {"fitted": len(fitted), "fit_failed": len(failed)},
     }

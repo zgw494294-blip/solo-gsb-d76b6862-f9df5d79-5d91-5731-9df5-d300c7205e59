@@ -14,7 +14,9 @@ from .solver import (
     SolverNotConverged,
     ValidationError,
     analyze_pipe_outages,
+    locate_single_leak,
     solve_network,
+    validate_leak_payload,
     validate_payload,
 )
 
@@ -78,6 +80,26 @@ async def analyze_outages(request: Request) -> JSONResponse:
     try:
         network = validate_payload(payload)
         analysis = analyze_pipe_outages(network)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+    except SolverNotConverged as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(content={"ok": True, "analysis": analysis})
+
+
+@app.post("/api/locate-leak")
+async def locate_leak(request: Request) -> JSONResponse:
+    """单点漏损定位：沿用管网校验与稳态求解，按实测水头逐节点拟合漏量。"""
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
+
+    try:
+        network, measurements, upper = validate_leak_payload(payload)
+        analysis = locate_single_leak(network, measurements, upper)
     except ValidationError as exc:
         return JSONResponse(status_code=422,
                             content={"ok": False, "error": str(exc)})
